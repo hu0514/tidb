@@ -1,0 +1,138 @@
+---
+- name: Ansible Install New Pd Cluster Or Rolling Update Pd Cluster
+  hosts: pd
+  remote_user: root
+  vars:
+    pd_name: "pd{{groups['pd'].index(inventory_hostname)+1}}"
+    pd_addr: "{{ansible_host}}:12379"
+    pd_version: "v2.1.7"
+  tasks:
+  - name: print host name
+    tags:
+     - always
+    debug:
+     msg: "{{ ansible_nodename }}"
+
+  - name: install epel-release
+    tags:
+     - always
+    yum:
+     name:
+      - python-pip
+      - glances
+      - jq
+     state: present
+
+  - name: install docker-py
+    tags:
+     - always
+    pip:
+     name: docker-py
+
+  - name: get docker-ce.repo
+    tags:
+     - always
+    get_url: 
+     url: https://download.docker.com/linux/centos/docker-ce.repo 
+     dest: /etc/yum.repos.d/docker-ce.repo
+
+  - name: install docker
+    tags:
+     - always
+    yum:
+     name: "{{item}}"
+     state: present
+     update_cache: yes
+    with_items:
+     - yum-utils
+     - device-mapper-persistent-data
+     - lvm2
+     - containerd.io
+     - docker-ce-cli
+     - docker-ce
+
+  - name: start docker service
+    tags:
+     - always
+    service:
+     name: docker
+     state: started
+
+  - name: pull PD image
+    tags:
+     - always
+    docker_image:
+     name: "pingcap/pd:{{pd_version}}"
+     
+  - name: get PD leader info
+    uri:
+     url: "http://{{ansible_host}}:12379/pd/api/v1/leader"
+     method: GET
+     status_code: 200
+    register: pd_leader_info
+  
+  - set_fact:
+     pd_leader: "{{pd_leader_info.json.name}}"
+
+  - name: print leader info
+    debug:
+     msg: "{{pd_leader}}"
+
+  - name: print pd_name info
+    debug:
+     msg: "{{pd_name}}"
+
+  - name: transfer leader
+    uri:
+     url: "http://{{ansible_host}}:12379/pd/api/v1/leader/resign"
+     method: POST
+     status_code: 200
+    when:
+     - pd_leader == pd_name
+
+  - name: stop PD container
+    docker_container:
+     name: pd1
+     state: stopped
+
+  - name: wait for PD down
+    wait_for:
+     host: "{{ansible_host}}"
+     port: 12379
+     state: stopped
+     msg: PD cannot shutdown
+
+  - name: remove PD contaier
+    docker_container:
+     name: pd1
+     state: absent
+
+  - name: start PD container
+    tags:
+     - always
+    docker_container:
+     image: "pingcap/pd:{{pd_version}}"
+     name: "{{pd_name}}"
+     network_mode: host
+     volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /data:/data
+     command: --name="pd1"
+              --data-dir="/data/pd1"
+              --client-urls="http://0.0.0.0:12379"
+              --advertise-client-urls="http://47.52.230.165:12379"
+              --peer-urls="http://0.0.0.0:12380"
+              --advertise-peer-urls="http://47.52.230.165:12380"
+              --initial-cluster="pd1=http://47.52.230.165:12380,pd2=http://47.52.230.165:22380,pd3=http://47.52.230.165:32380"
+              --config="/data/conf/pd.toml"
+
+  - name: wait for PD up
+    tags:
+     - always
+    wait_for:
+     host: "{{ansible_host}}"
+     port: 12379
+     state: started
+     msg: PD start failure
+      
+
