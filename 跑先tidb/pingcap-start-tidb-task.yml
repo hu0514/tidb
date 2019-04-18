@@ -1,0 +1,189 @@
+# New Install
+# ansible-playbook -i /data/ansible/hosts pingcap-start-tidb-task.yml
+
+# Rolling Updata
+# ansible-playbook -i /data/ansible/hosts pingcap-start-tidb-task.yml
+---
+- name: Ansible Deploy pingcap-start-tidb-task.yml
+  vars:
+    # env: dev
+    # env: test
+    env: prod
+    host_env: "{{ env }}-"
+    tidb_version: "v2.1.2"
+    host: "{{ host_env }}mdw-tidb"
+    pd_groups: "{{ host_env }}mdw-pd"
+    data_path: "/data/usr-data"
+    conf_path: "/data/ansible/tidb_conf"
+    fluentd_version: v1.2.6
+    fluentd_config: "{{ host_env }}fluent-client.conf"
+    fluentd_folder: "mdw-{{ env }}"
+    fluentd_project: "{{ host }}"
+  hosts: "{{ host }}"
+  remote_user: root
+  # gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+
+  tasks:
+  - name: Print Host Name
+    debug:
+      msg: "{{ ansible_hostname }}"
+  
+  - name: Install epel-release
+    yum:
+      name: 
+        - epel-release
+
+  - name: Install JQ and Pip and glances
+    yum:
+      name: 
+        - jq
+        - python-pip
+        - glances
+
+  - name: Install docker-py
+    pip:
+      name: docker-py
+
+  - name: Create data directory
+    file:
+      path: "{{ data_path }}"
+      state: directory
+
+  - name: Send tidb conf file
+    template:
+      src: "{{ conf_path }}/tidb.toml.j2"
+      dest: "{{ data_path }}/tidb.toml"
+
+  - name: Pull an TiDB Image
+    docker_image:
+      name: "pingcap/tidb:{{ tidb_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Pull an Fluentd Image
+    docker_image:
+      name: "fluent/fluentd:{{ fluentd_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Create Fluentd Config Directory
+    file:
+      path: /data/usr-data/fluentd
+      state: directory
+
+  - name: Send Fluentd Config file
+    copy:
+      src: "/data/ansible/fluentd/{{ fluentd_config }}"
+      dest: /data/usr-data/fluentd/fluent-client.conf
+
+  - name: Start Fluentd Client Container
+    docker_container:
+      name: "fluentd-client"
+      image: "fluent/fluentd:{{ fluentd_version }}"
+      network_mode: host
+      restart_policy: always
+      state: started
+      recreate: yes
+      volumes:
+        - /data/usr-data/fluentd/fluent-client.conf:/fluentd/etc/fluent.conf
+        - /etc/localtime:/etc/localtime
+
+  - name: Wait for fluentd container up
+    wait_for: 
+      port: 24224
+      timeout: 120
+      msg: 24224 Port startup failed of the 120 seconds
+
+  - name: Change kernel value
+    sysctl:
+      name: vm.swappiness
+      value: 0
+      ignoreerrors: yes
+      state: present
+
+  - name: stopped container
+    docker_container:
+      name: "{{ host_env }}tidb-{{ groups[host].index(inventory_hostname)+1 }}"
+      state: stopped
+    ignore_errors: yes
+
+  - name: wait for PD down
+    wait_for: 
+      host: "{{ ansible_host }}"
+      port: 3306
+      state: stopped
+      timeout: 60
+      msg: 80 Port startup failed of the 60 seconds
+    ignore_errors: yes
+
+  - name: remove container
+    docker_container:
+      name: "{{ host_env }}tidb-{{ groups[host].index(inventory_hostname)+1 }}"
+      state: absent
+    ignore_errors: yes
+
+  - name: Start TiDB Container
+    docker_container:
+      name: "{{ host_env }}tidb-{{ groups[host].index(inventory_hostname)+1 }}"
+      hostname: "{{ host_env }}tidb-{{ groups[host].index(inventory_hostname)+1 }}"
+      image: "pingcap/tidb:{{ tidb_version }}"
+      network_mode: host
+      ulimits: nofile:1000000:1000000
+      sysctls: net.ipv4.tcp_syncookies=0
+      user: root
+      # restart_policy: "{% if host_env == 'prod-' %}always{% else %}no{% endif %}"
+      restart_policy: always
+      # memory: "{% if host_env == 'prod-' %}{{ (ansible_memtotal_mb * 0.9) | int }}M{% else %}{{ (ansible_memtotal_mb * 0.75) | int }}M{% endif %}"
+      # memory: "{{ ansible_memtotal_mb - 550 }}M"
+      state: started
+      env:
+        TZ: Asia/Shanghai
+        fluentd-folder: "{{ fluentd_folder }}"
+        fluentd-project: "{{ fluentd_project }}"
+      log_driver: fluentd
+      log_options:
+        fluentd-address: "localhost:24224"
+        fluentd-async-connect: "true"
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "3000"
+        env: "fluentd-folder,fluentd-project"
+      volumes:
+        - "{{ data_path }}/tidb.toml:/tidb.toml"
+        # - /etc/timezone:/etc/TZ
+        # - /etc/timezone:/etc/timezone
+        # - /etc/localtime:/etc/localtime
+      command: -store=tikv
+               -path="{% set all_pd = [] %}{% set pd_hosts = groups[pd_groups] %}{% for host1 in pd_hosts -%}{% set pd_ip = hostvars[host1].inventory_hostname %}{% set pd_port = 2379 %}{% set _ = all_pd.append('%s:%s' % (pd_ip, pd_port)) %}{% endfor %}{{ all_pd | join(',') }}"
+               -metrics-addr="{{ host_env }}prometheus-pushgateway.runxsports.com:9091"
+               -metrics-interval="15"
+               -L="{% if host_env == 'prod-' %}warn{% else %}info{% endif %}"
+               -P=3306
+               -config="/tidb.toml"
+   #            -log-slow-query="/logs/slow-query-{{ groups[host].index(inventory_hostname)+1 }}.log"
+  - name: Wait for TiDB UP
+    wait_for: 
+      port: 3306
+      msg: Port Startup Failed
+
+  - name: Get TiDB Status 
+    uri:
+      url: "http://127.0.0.1:10080/status"
+      method: GET
+      return_content: yes
+      status_code: 200
+    register: result
+    until: result.status is defined and result.status == 200
+    retries: 10
+    delay: 5
+
+  - name: Print TiDB Status
+    debug:
+      msg: "{{ result }}"

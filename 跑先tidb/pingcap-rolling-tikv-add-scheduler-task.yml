@@ -1,0 +1,103 @@
+---
+# get_pd_tikv_addr
+- set_fact:
+    pd_host: "{{ hostvars[groups[pd_groups][0]].inventory_hostname }}"
+    pd_client_port: 2379
+
+
+- set_fact:
+    pd_addr: "{{ pd_host }}:{{ pd_client_port }}"
+    tikv_addr: "{{ ansible_host }}:20160"
+
+- name: display pd addr
+  debug:
+    var: pd_addr
+
+- name: display tikv addr
+  debug:
+    var: tikv_addr
+
+# get_store_id
+- name: get store info from PD
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/stores"
+    method: GET
+    return_content: yes
+    status_code: 200
+  register: stores_info
+
+- set_fact:
+    store_id: "{{ item }}"
+  with_items: "{{ stores_info.json|json_query(store_id_query) }}"
+  vars:
+    store_id_query: "stores[?store.address==`{{ tikv_addr }}`].store.id"
+
+- name: display store id
+  debug:
+    var: store_id
+
+
+# add_evict_leader_scheduler
+- name: remove evict-leader-scheduler
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/schedulers/evict-leader-scheduler-{{ store_id }}"
+    method: DELETE
+    status_code: 200,500
+    return_content: yes
+  register: remove_scheduler_info_1
+  until: "'scheduler not found' in remove_scheduler_info_1.content"
+  retries: 10
+  delay: 5
+
+- name: display remove scheduler info 1
+  debug:
+    var: remove_scheduler_info_1
+
+- name: add evict-leader-scheduler
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/schedulers"
+    method: POST
+    status_code: 200
+    body_format: json
+    body:
+      name: "evict-leader-scheduler"
+      store_id: "{{ store_id }}"
+  register: add_scheduler_info
+
+- name: display add scheduler info
+  debug:
+    var: add_scheduler_info
+
+- name: check tikv's leader count
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/store/{{ store_id }}"
+    method: GET
+    return_content: yes
+    body_format: json
+    status_code: 200
+  register: store_info
+  until: (store_info.json.status.leader_count is defined and store_info.json.status.leader_count|int < 1) or store_info.json.status.leader_count is not defined
+  retries: 30
+  delay: 15
+  failed_when: false
+
+- name: display leader_count
+  debug:
+    msg: "leader_count: {{ store_info.json.status.leader_count|default(0) }}"
+
+- name: stopped container
+  docker_container:
+    name: "{{ host_env }}tikv-{{ groups[host].index(inventory_hostname)+1 }}"
+    state: stopped
+
+- name: wait for PD down
+  wait_for: 
+    host: "{{ ansible_host }}"
+    port: 20160
+    state: stopped
+    msg: Port Stopped Failed
+
+- name: remove container
+  docker_container:
+    name: "{{ host_env }}tikv-{{ groups[host].index(inventory_hostname)+1 }}"
+    state: absent

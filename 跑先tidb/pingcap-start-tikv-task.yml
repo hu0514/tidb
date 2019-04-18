@@ -1,0 +1,198 @@
+# New Install
+# ansible-playbook -i /data/ansible/hosts pingcap-start-tikv-task.yml --tags always
+
+# Rolling Updata
+# ansible-playbook -i /data/ansible/hosts pingcap-start-tikv-task.yml --tags rolling
+---
+- name: Ansible Deploy pingcap-start-tikv-task.yml
+  vars:
+    # env: dev
+    # env: test
+    env: prod
+    host_env: "{{ env }}-"
+    tikv_version: "v2.1.2"
+    host: "{{ host_env }}mdw-tikv"
+    pd_groups: "{{ host_env }}mdw-pd"
+    data_path: "/data/usr-data"
+    conf_path: "/data/ansible/tidb_conf"
+    fluentd_version: v1.2.6
+    fluentd_config: "{{ host_env }}fluent-client.conf"
+    fluentd_folder: "mdw-{{ env }}"
+    fluentd_project: "{{ host }}"
+  hosts: "{{ host }}"
+  remote_user: root
+  # gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+
+  tasks:
+  - name: Print Host Name
+    tags: 
+      - always
+    debug:
+      msg: "{{ ansible_hostname }}"
+  
+  - name: Install epel-release
+    tags: 
+      - always
+    yum:
+      name: 
+        - epel-release
+
+  - name: Install JQ and Pip and glances
+    tags: 
+      - always
+    yum:
+      name: 
+        - jq
+        - python-pip
+        - glances
+
+  - name: Install docker-py
+    tags: 
+      - always
+    pip:
+      name: docker-py
+
+  - name: Create data directory
+    tags: 
+      - always
+    file:
+      path: "{{ data_path }}"
+      state: directory
+
+  - name: Send tikv conf file
+    tags: 
+      - always
+    template:
+      src: "{{ conf_path }}/tikv.toml.j2"
+      dest: "{{ data_path }}/tikv.toml"
+
+  - name: Pull an TiKV Image
+    tags: 
+      - always
+    docker_image:
+      name: "pingcap/tikv:{{ tikv_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Pull an Fluentd Image
+    tags: 
+      - always
+    docker_image:
+      name: "fluent/fluentd:{{ fluentd_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Create Fluentd Config Directory
+    tags: 
+      - always
+    file:
+      path: /data/usr-data/fluentd
+      state: directory
+
+  - name: Send Fluentd Config file
+    tags: 
+      - always
+    copy:
+      src: "/data/ansible/fluentd/{{ fluentd_config }}"
+      dest: /data/usr-data/fluentd/fluent-client.conf
+
+  - name: Start Fluentd Client Container
+    tags: 
+      - always
+    docker_container:
+      name: "fluentd-client"
+      image: "fluent/fluentd:{{ fluentd_version }}"
+      network_mode: host
+      restart_policy: always
+      state: started
+      recreate: yes
+      volumes:
+        - /data/usr-data/fluentd/fluent-client.conf:/fluentd/etc/fluent.conf
+        - /etc/localtime:/etc/localtime
+
+  - name: Wait for fluentd container up
+    tags: 
+      - always
+    wait_for: 
+      port: 24224
+      timeout: 120
+      msg: 24224 Port startup failed of the 120 seconds
+
+  - name: Change kernel value
+    tags: 
+      - always
+    sysctl:
+      name: vm.swappiness
+      value: 0
+      ignoreerrors: yes
+      state: present
+
+
+  - name: rolling update Tikv cluster add scheduler
+    tags:
+      - rolling
+    include_tasks: "pingcap-rolling-tikv-add-scheduler-task.yml"
+
+
+  - name: Start TiKV Container
+    tags: 
+      - always
+    docker_container:
+      name: "{{ host_env }}tikv-{{ groups[host].index(inventory_hostname)+1 }}"
+      hostname: "{{ host_env }}tikv-{{ groups[host].index(inventory_hostname)+1 }}"
+      image: "pingcap/tikv:{{ tikv_version }}"
+      network_mode: host
+      ulimits: nofile:1000000:1000000
+      sysctls: net.ipv4.tcp_syncookies=0
+      user: root
+      # restart_policy: "{% if host_env == 'prod-' %}always{% else %}no{% endif %}"
+      restart_policy: always
+      # memory: "{% if host_env == 'prod-' %}{{ (ansible_memtotal_mb * 0.9) | int }}M{% else %}{{ (ansible_memtotal_mb * 0.75) | int }}M{% endif %}"
+      # memory: "{{ ansible_memtotal_mb - 550 }}M"
+      state: started
+      # restart: yes
+      env:
+        # TZ: Asia/Shanghai
+        fluentd-folder: "{{ fluentd_folder }}"
+        fluentd-project: "{{ fluentd_project }}"
+      log_driver: fluentd
+      log_options:
+        fluentd-address: "localhost:24224"
+        fluentd-async-connect: "true"
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "3000"
+        env: "fluentd-folder,fluentd-project"
+      volumes:
+        # - /etc/timezone:/etc/TZ
+        - /etc/timezone:/etc/timezone
+        - /etc/localtime:/etc/localtime
+        - "{{ data_path }}/tikv-{{ groups[host].index(inventory_hostname)+1 }}:/data"
+        - "{{ data_path }}/tikv.toml:/tikv.toml"
+      command: --addr="0.0.0.0:20160"
+               --advertise-addr="{{ ansible_host }}:20160"
+               --data-dir="/data"
+               --pd="{% set all_pd = [] %}{% set pd_hosts = groups[pd_groups] %}{% for host1 in pd_hosts -%}{% set pd_ip = hostvars[host1].inventory_hostname %}{% set pd_port = 2379 %}{% set _ = all_pd.append('%s:%s' % (pd_ip, pd_port)) %}{% endfor %}{{ all_pd | join(',') }}"
+               --log-level="{% if host_env == 'prod-' %}warn{% else %}info{% endif %}"
+               --config="/tikv.toml"
+
+  - name: Wait for Tikv UP
+    tags: 
+      - always
+    wait_for: 
+      port: 20160
+      msg: Port Startup Failed
+      state: started
+
+
+  - name: rolling update Tikv cluster remove scheduler
+    tags:
+      - rolling
+    include_tasks: "pingcap-rolling-tikv-remove-scheduler-task.yml"

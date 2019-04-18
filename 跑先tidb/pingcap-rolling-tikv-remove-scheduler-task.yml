@@ -1,0 +1,11 @@
+# remove_evict_leader_scheduler
+- name: remove evict-leader-scheduler
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/schedulers/evict-leader-scheduler-{{ store_id }}"
+    method: DELETE
+    status_code: 200
+  register: remove_scheduler_info_2
+
+- name: display remove scheduler info 2
+  debug:
+    var: remove_scheduler_info_2

@@ -1,0 +1,78 @@
+---
+- set_fact:
+    pd_addr: "{{ ansible_host }}:2379"
+    pd_name: "pd{{ groups[host].index(inventory_hostname)+1 }}"
+
+- name: display PD name
+  debug:
+    var: pd_name
+
+- name: display PD address
+  debug:
+    var: pd_addr
+
+- name: get PD leader info
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/leader"
+    method: GET
+    return_content: yes
+    status_code: 200
+  register: pd_leader_info
+
+
+# transfer PD leader
+- set_fact:
+    pd_leader_name: "{{ pd_leader_info.json.name }}"
+
+- name: display PD leader name
+  debug:
+    var: pd_leader_name
+
+- name: transfer PD leader to another PD server
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/leader/resign"
+    method: POST
+    status_code: 200
+  when:
+    - groups[host] | length >= 3
+    - pd_leader_name == pd_name
+
+- name: wait for transfering PD leader
+  pause:
+      seconds: 10
+  when:
+    - groups[host] | length >= 3
+    - pd_leader_name == pd_name
+
+- name: check current PD leader
+  uri:
+    url: "http://{{ pd_addr }}/pd/api/v1/leader"
+    method: GET
+    return_content: yes
+    body_format: json
+    status_code: 200
+  register: pd_leader_info
+  until: pd_leader_info.json.name is defined and pd_leader_info.json.name != pd_name
+  retries: 12
+  delay: 10
+  failed_when: false
+  when:
+    - groups[host] | length >= 3
+    - pd_leader_name == pd_name
+
+- name: stopped container
+  docker_container:
+    name: "{{ host_env }}pd-{{ groups[host].index(inventory_hostname)+1 }}"
+    state: stopped
+
+- name: wait for PD down
+  wait_for: 
+    host: "{{ ansible_host }}"
+    port: 2379
+    state: stopped
+    msg: Port Stopped Failed
+
+- name: remove container
+  docker_container:
+    name: "{{ host_env }}pd-{{ groups[host].index(inventory_hostname)+1 }}"
+    state: absent

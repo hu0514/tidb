@@ -1,0 +1,189 @@
+# New Install
+# ansible-playbook -i /data/ansible/hosts pingcap-start-pd-task.yml --tags always
+
+# Rolling Updata
+# ansible-playbook -i /data/ansible/hosts pingcap-start-pd-task.yml --tags rolling
+
+# Remove PD Leader
+# curl -X POST http://127.0.0.1:2379/pd/api/v1/leader/resign
+---
+- name: Ansible Deploy pingcap-start-pd-task.yml
+  vars:
+    # env: dev
+    # env: test
+    env: prod
+    host_env: "{{ env }}-"
+    pd_version: "v2.1.2"
+    host: "{{ host_env }}mdw-pd"
+    data_path: "/data/usr-data"
+    conf_path: "/data/ansible/tidb_conf"
+    fluentd_version: v1.2.6
+    fluentd_config: "{{ host_env }}fluent-client.conf"
+    fluentd_folder: "mdw-{{ env }}"
+    fluentd_project: "{{ host }}"
+  hosts: "{{ host }}"
+  remote_user: root
+  # gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+
+  tasks:
+  - name: Print Host Name
+    tags: 
+      - always
+    debug:
+      msg: "{{ ansible_hostname }}"
+  
+  - name: Install epel-release
+    tags: 
+      - always
+    yum:
+      name: 
+        - epel-release
+
+  - name: Install JQ and Pip and glances
+    tags: 
+      - always
+    yum:
+      name: 
+        - jq
+        - python-pip
+        - glances
+
+  - name: Install docker-py
+    tags: always
+    pip:
+      name: docker-py
+
+  - name: Create data directory
+    tags: 
+      - always
+    file:
+      path: "{{ data_path }}"
+      state: directory
+
+  - name: Send pd conf file
+    tags: 
+      - always
+    template:
+      src: "{{ conf_path }}/pd.toml.j2"
+      dest: "{{ data_path }}/pd.toml"
+
+  - name: Pull an PD Image
+    tags: 
+      - always
+    docker_image:
+      name: "pingcap/pd:{{ pd_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Pull an Fluentd Image
+    tags: 
+      - always
+    docker_image:
+      name: "fluent/fluentd:{{ fluentd_version }}"
+      http_timeout: 300
+    register: result
+    until: result | success
+    retries: 20
+    delay: 5
+
+  - name: Create Fluentd Config Directory
+    tags: 
+      - always
+    file:
+      path: /data/usr-data/fluentd
+      state: directory
+
+  - name: Send Fluentd Config file
+    tags: 
+      - always
+    copy:
+      src: "/data/ansible/fluentd/{{ fluentd_config }}"
+      dest: /data/usr-data/fluentd/fluent-client.conf
+
+  - name: Start Fluentd Client Container
+    tags: 
+      - always
+    docker_container:
+      name: "fluentd-client"
+      image: "fluent/fluentd:{{ fluentd_version }}"
+      network_mode: host
+      restart_policy: always
+      state: started
+      recreate: yes
+      volumes:
+        - /data/usr-data/fluentd/fluent-client.conf:/fluentd/etc/fluent.conf
+        - /etc/localtime:/etc/localtime
+
+  - name: Wait for fluentd container up
+    tags: 
+      - always
+    wait_for: 
+      port: 24224
+      timeout: 120
+      msg: 24224 Port startup failed of the 120 seconds
+
+  - name: Change kernel value
+    tags: 
+      - always
+    sysctl:
+      name: vm.swappiness
+      value: 0
+      ignoreerrors: yes
+      state: present
+
+  - name: rolling update PD cluster
+    tags: 
+      - rolling
+    include_tasks: "pingcap-rolling-pd-task.yml"
+
+  - name: Start PD Container
+    tags: always
+    docker_container:
+      name: "{{ host_env }}pd-{{ groups[host].index(inventory_hostname)+1 }}"
+      hostname: "{{ host_env }}pd-{{ groups[host].index(inventory_hostname)+1 }}"
+      image: "pingcap/pd:{{ pd_version }}"
+      network_mode: host
+      ulimits: nofile:1000000:1000000
+      user: root
+      # restart_policy: "{% if host_env == 'prod-' %}always{% else %}no{% endif %}"
+      restart_policy: always
+      state: started
+      env:
+        TZ: Asia/Shanghai
+        fluentd-folder: "{{ fluentd_folder }}"
+        fluentd-project: "{{ fluentd_project }}"
+      log_driver: fluentd
+      log_options:
+        fluentd-address: "localhost:24224"
+        fluentd-async-connect: "true"
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "3000"
+        env: "fluentd-folder,fluentd-project"
+      volumes:
+        # - /etc/timezone:/etc/timezone
+        # - /etc/localtime:/etc/localtime
+        - "{{ data_path }}/pd-{{ groups[host].index(inventory_hostname)+1 }}:/data"
+        - "{{ data_path }}/pd.toml:/pd.toml"
+      command: -name="pd{{ groups[host].index(inventory_hostname)+1 }}"
+               -L="info"
+               -data-dir="/data"
+               -client-urls="http://0.0.0.0:2379"
+               -advertise-client-urls="http://{{ ansible_host }}:2379"
+               -peer-urls="http://0.0.0.0:2380"
+               -advertise-peer-urls="http://{{ ansible_host }}:2380"
+               -initial-cluster="{% set all_pd = [] %}{% set pd_name_prefix = 'pd' %}{% for host1 in groups[host] %}{% set other_ip = hostvars[host1].inventory_hostname %}{% set other_port = 2380 %}{% set other_pd_name_surfix = groups[host].index(host1) + 1 %}{% set other_pd_name = pd_name_prefix ~ other_pd_name_surfix %}{% set _ = all_pd.append('%s=http://%s:%s' % (other_pd_name, other_ip, other_port)) %}{% endfor %}{{ all_pd | join(',') }}"
+               -config="/pd.toml"
+
+  - name: Wait for PD UP
+    tags: 
+      - always
+    wait_for: 
+      host: "{{ ansible_host }}"
+      port: 2379
+      state: started
+      msg: Port Startup Failed
