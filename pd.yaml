@@ -1,11 +1,13 @@
 ---
 - name: Ansible Install New Pd Cluster Or Rolling Update Pd Cluster
-  hosts: pd
+  hosts: 47.52.230.165
   remote_user: root
   vars:
     pd_name: "pd{{groups['pd'].index(inventory_hostname)+1}}"
     pd_addr: "{{ansible_host}}:12379"
     pd_version: "v2.1.7"
+  serial: 1
+  any_errors_fatal: true
   tasks:
   - name: print host name
     tags:
@@ -65,24 +67,36 @@
      name: "pingcap/pd:{{pd_version}}"
      
   - name: get PD leader info
+    tags:
+     - rolling
     uri:
      url: "http://{{ansible_host}}:12379/pd/api/v1/leader"
      method: GET
      status_code: 200
     register: pd_leader_info
+    #ignore_errors: yes
   
-  - set_fact:
+  - name: set_fact pd_leader
+    tags:
+     - rolling
+    set_fact:
      pd_leader: "{{pd_leader_info.json.name}}"
 
   - name: print leader info
+    tags:
+     - rolling
     debug:
      msg: "{{pd_leader}}"
 
   - name: print pd_name info
+    tags:
+     - rolling
     debug:
      msg: "{{pd_name}}"
 
   - name: transfer leader
+    tags:
+     - rolling
     uri:
      url: "http://{{ansible_host}}:12379/pd/api/v1/leader/resign"
      method: POST
@@ -91,11 +105,15 @@
      - pd_leader == pd_name
 
   - name: stop PD container
+    tags:
+     - rolling
     docker_container:
      name: pd1
      state: stopped
 
   - name: wait for PD down
+    tags:
+     - rolling
     wait_for:
      host: "{{ansible_host}}"
      port: 12379
@@ -103,6 +121,8 @@
      msg: PD cannot shutdown
 
   - name: remove PD contaier
+    tags:
+     - rolling
     docker_container:
      name: pd1
      state: absent
@@ -123,7 +143,7 @@
               --advertise-client-urls="http://47.52.230.165:12379"
               --peer-urls="http://0.0.0.0:12380"
               --advertise-peer-urls="http://47.52.230.165:12380"
-              --initial-cluster="pd1=http://47.52.230.165:12380,pd2=http://47.52.230.165:22380,pd3=http://47.52.230.165:32380"
+              --initial-cluster="{% set pd_all=[] %}{% for cluster_host in groups['pd'] %}{% set cluster_ip=hostvars[cluster_host].inventory_hostname %}{% set cluster_number=groups['pd'].index(inventory_hostname)+1%}{% set cluster_port=2380 %}{% set _=pd_all.append('pd%s=http://%s:%s'%(cluster_number,cluster_ip,cluster_port)) %}{% endfor %}{{pd_all|join(',')}}"
               --config="/data/conf/pd.toml"
 
   - name: wait for PD up
