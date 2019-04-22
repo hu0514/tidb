@@ -1,0 +1,122 @@
+---
+- name: tidb
+  hosts: 47.52.230.165
+  remote_user: root
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+  - set_fact:
+     tidb_version: "v2.1.7"
+  - name: print host name
+    tags:
+     - always
+    debug:
+     msg: "{{ ansible_nodename }}"
+
+  - name: install epel-release
+    tags:
+     - always
+    yum:
+     name:
+      - python-pip
+      - glances
+      - jq
+     state: present
+
+  - name: install docker-py
+    tags:
+     - always
+    pip:
+     name: docker-py
+
+  - name: get docker-ce.repo
+    tags:
+     - always
+    get_url: 
+     url: https://download.docker.com/linux/centos/docker-ce.repo 
+     dest: /etc/yum.repos.d/docker-ce.repo
+
+  - name: install docker
+    tags:
+     - always
+    yum:
+     name: "{{item}}"
+     state: present
+     update_cache: yes
+    with_items:
+     - yum-utils
+     - device-mapper-persistent-data
+     - lvm2
+     - containerd.io
+     - docker-ce-cli
+     - docker-ce
+
+  - name: start docker service
+    tags:
+     - always
+    service:
+     name: docker
+     state: started
+
+  - name: pull PD image
+    tags:
+     - always
+    docker_image:
+     name: "pingcap/tidb:{{tidb_version}}"
+  - name: stop tidb container
+    tags:
+     - rolling
+    docker_container:
+     name: "tidb{{groups['pd'].index(inventory_hostname)+1}}"
+     state: stopped
+  - name: wait for tidb down
+    tags:
+     - rolling
+    wait_for:
+     port: 4000
+     state: stopped
+     msg: Tidb Stopped Failed
+  - name: remove tidb container
+    tags:
+     - rolling
+    docker_container:
+     name: "tidb{{groups['pd'].index(inventory_hostname)+1}}"
+     state: absent
+  - name: start tidb container
+    tags:
+     - always
+    docker_container:
+     image: "pingcap/tidb:{{tidb_version}}"
+     name: "tidb{{groups['pd'].index(inventory_hostname)+1}}"
+     network_mode: host
+     volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /data:/data 
+     command:  --store=tikv
+               --path="{% set pd_cluster=[] %}{% for host1 in groups['pd'] %}{% set pd_host_ip=hostvars[host1].inventory_hostname %}{% set pd_host_port=2379 %}{% set _=pd_cluster.append( '%s:%s' % ( pd_host_ip,pd_host_port ) ) %}{% endfor %}{{pd_cluster|join( ',' )}}"
+               --config="/data/conf/tidb.toml"
+  - name: wait for tidb up
+    tags:
+     - always
+    wait_for:
+     port: 4000
+     state: started
+     msg: Tidb Started Failed
+  - name: get tidb status
+    tags:
+     - always
+    uri:
+     url: "http://127.0.0.1:10080/status"
+     method: GET
+     return_content: yes
+     status_code: 200
+    register: result
+    until: result.status is defined and result.status == 200
+    retries: 10
+    delay: 5
+  - name: print tidb status
+    tags:
+     - always
+    debug:
+     msg: "{{result}}"
+    

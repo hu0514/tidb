@@ -1,0 +1,217 @@
+---
+- name: Ansible Install New Tikv Cluster Or Rolling Update Tikv Cluster
+  hosts: 47.52.230.165
+  remote_user: root
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+  - set_fact:
+     pd_addr: "{{hostvars[groups['pd'][0]].inventory_hostname}}"
+     pd_client_port: 12379
+     tikv_addr: "{{ansible_host}}"
+     tikv_port: "20161"
+     tikv_version: "v2.1.7"
+
+  - name: print host name
+    tags:
+     - always
+    debug:
+     msg: "{{ ansible_nodename }}"
+
+  - name: install epel-release
+    tags:
+     - always
+    yum:
+     name:
+      - python-pip
+      - glances
+      - jq
+     state: present
+
+  - name: install docker-py
+    tags:
+     - always
+    pip:
+     name: docker-py
+
+  - name: get docker-ce.repo
+    tags:
+     - always
+    get_url: 
+     url: https://download.docker.com/linux/centos/docker-ce.repo 
+     dest: /etc/yum.repos.d/docker-ce.repo
+
+  - name: install docker
+    tags:
+     - always
+    yum:
+     name: "{{item}}"
+     state: present
+     update_cache: yes
+    with_items:
+     - yum-utils
+     - device-mapper-persistent-data
+     - lvm2
+     - containerd.io
+     - docker-ce-cli
+     - docker-ce
+
+  - name: start docker service
+    tags:
+     - always
+    service:
+     name: docker
+     state: started
+
+  - name: pull PD image
+    tags:
+     - always
+    docker_image:
+     name: "pingcap/tikv:{{tikv_version}}"
+  - name: print pd_addr
+    tags:
+     - rolling
+    debug:
+     msg: "{{pd_addr}}"
+  - name: print tikv_addr
+    tags:
+     - rolling
+    debug:
+     msg: "{{tikv_addr}}"
+  - name: get store info from pd
+    tags:
+     - rolling
+    uri:
+     url: "http://{{pd_addr}}:{{pd_client_port}}/pd/api/v1/stores"
+     method: GET
+     return_content: yes
+     status_code: 200
+    register: stores_info
+  - name: set store id
+    tags:
+     - rolling
+    set_fact:
+     store_id: "{{ item }}"
+    with_items: "{{ stores_info.json|json_query(store_id_query) }}"
+    vars:
+     store_id_query: "stores[?store.address==`{{ tikv_addr }}:{{tikv_port}}`].store.id"
+  - name: print store id
+    tags:
+     - rolling
+    debug:
+     msg: "{{store_id}}"
+  - name: remove evice-leader-scheduler
+    tags:
+     - rolling
+    uri:
+     url: "http://{{pd_addr}}:{{pd_client_port}}/pd/api/v1/schedulers/evict-leader-scheduler-{{store_id}}"
+     method: DELETE
+     status_code: 200,500
+     return_content: yes
+    register: remove_scheduler_info_1
+    until: "'scheduler not found' in remove_scheduler_info_1.content "
+    retries: 10
+    delay: 5
+  - name: print remove scheduler info 1
+    tags:
+     - rolling
+    debug:
+     msg: "{{remove_scheduler_info_1}}"
+  - name: add evict-leader-scheduler
+    tags:
+     - rolling
+    uri:
+     url: "http://{{pd_addr}}:{{pd_client_port}}/pd/api/v1/schedulers"
+     method: POST
+     status_code: 200
+     body_format: json
+     body:
+      name: "evict-leader-scheduler"
+      store_id: "{{store_id}}"
+    register: add_scheduler_info
+  - name: print add scheduler info
+    tags:
+     - rolling
+    debug: 
+     msg: "{{add_scheduler_info}}"
+  - name: check tikv's leader count
+    tags:
+     - rolling
+    uri:
+     url: "http://{{pd_addr}}:{{pd_client_port}}/pd/api/v1/store/{{store_id}}"
+     method: GET
+     return_content: yes
+     body_format: json
+     status_code: 200
+    register: store_info
+    until: (store_info.json.status.leader_count is defined and store_info.json.status.leader_count|int < 1) or store_info.json.status.leader_count is not defined
+    retries: 30
+    delay: 15
+    failed_when: false
+  - name: print leader_count
+    tags:
+     - rolling
+    debug:
+     msg: "leader_count: {{ store_info.json.status.leader_count|default(0) }}"
+  - name: stopped container
+    tags:
+     - rolling
+    docker_container:
+     name: "tikv{{groups['pd'].index(inventory_hostname)+1}}"
+     state: stopped
+  - name: wait for tikv down
+    tags:
+     - rolling
+    wait_for:
+     host: "{{ansible_host}}"
+     port: "{{tikv_port}}"
+     state: stopped
+     msg: Port Stopped Failed
+  - name: remove container
+    tags:
+     - rolling
+    docker_container:
+     name: "tikv{{groups['pd'].index(inventory_hostname)+1}}"
+     state: absent
+
+
+  - name: start tikv container
+    tags:
+     - always
+    docker_container:
+     image: "pingcap/tikv:{{tikv_version}}"
+     name: "tikv{{groups['pd'].index(inventory_hostname)+1}}"
+     network_mode: host
+     volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /data:/data
+     ulimits: nofile:1000000:1000000
+     command:  --addr="0.0.0.0:{{tikv_port}}"
+               --advertise-addr="{{tikv_addr}}:{{tikv_port}}"
+               --data-dir="/data/tikv{{groups['pd'].index(inventory_hostname)+1}}"
+               --pd="{% set pd_cluster=[] %}{% for host1 in groups['pd'] %}{% set pd_host_ip=hostvars[host1].inventory_hostname %}{% set pd_host_port=2379 %}{% set _=pd_cluster.append( '%s:%s' % ( pd_host_ip,pd_host_port ) ) %}{% endfor %}{{ pd_cluster | join( ',' ) }}"
+               --config="/data/conf/tikv.toml"
+     state: started
+     restart_policy: always
+  - name: wait for tikv up
+    tags:
+     - always
+    wait_for:
+     port: "{{tikv_port}}"
+     msg: Port Startup Failed
+     state: started
+
+
+  - name: remove evict leader scheduler
+    tags:
+     - rolling
+    uri:
+     url: "http://{{pd_addr}}:{{pd_client_port}}/pd/api/v1/schedulers/evict-leader-scheduler-{{store_id}}"
+     method: DELETE
+     status_code: 200
+    register: remove_scheduler_info_2
+  - name: print remove scheduler info 2
+    tags:
+     - rolling
+    debug:
+     msg: "{{remove_scheduler_info_2}}"
