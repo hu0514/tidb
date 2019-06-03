@@ -169,3 +169,10 @@ docker run -d \
     grafana/grafana
 
 登陆grafana 添加数据源 导入模板 
+
+
+数据接口：4000
+pd:
+ip:12379/pd/api/v1/members 查看成员
+ip:12379/pd/api/v1/leader 查看leader
+pd相互访问建议使用内网IP
